@@ -9,7 +9,141 @@ import numpy as np
 import pingouin as pg
 
 
-def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707):
+import numpy as np
+import warnings
+import pingouin as pg
+
+
+def bayes_binomtest(k, n, p=0.5, a=1, b=1, return_pval=False):
+    """
+    Compute Bayes Factors from a binomial test using a Beta-Binomial model,
+    applied to data that can be 0D, 1D, or 2D.
+    
+    Parameters
+    ----------
+    k : float, int, or array-like
+        Observed number of successes or observed accuracy.
+        If values are between 0 and 1, they will be interpreted as a probability 
+        of success and converted to number of successes by multiplying by n 
+        and rounding to the nearest integer.
+        
+        Shapes allowed:
+         - 0D: a single value
+         - 1D: (m) - e.g., decoding accuracies at multiple time points
+         - 2D: (m, l) - e.g., decoding accuracies for time-by-time generalization matrix
+         
+    n : int
+        Number of trials.
+        
+    p : float, default=0.5
+        The null hypothesis probability of success.
+        
+    a : float, default=1
+        Prior alpha parameter for the Beta distribution. Together with b, this defines
+        the prior Beta(a, b).
+        
+    b : float, default=1
+        Prior beta parameter for the Beta distribution.
+        
+    Returns
+    -------
+    BF10 : scalar, 1D array, or 2D array
+        The Bayes factor for each test location. Matches the shape of the input `k`, 
+        excluding the trial dimension (since `n` is a scalar).
+        
+    Notes
+    -----
+    This function is meant for applying a binomial Bayes factor test to single decoding accuracy
+    values or small sets thereof (e.g. across time or across a time-by-time matrix).
+    It is NOT intended for computing Bayes factors across subjects. For example, you might have
+    already averaged decoding accuracies across subjects and wish to test if the decoding accuracy
+    is better than chance.
+    """
+    # Convert input to array for consistent indexing
+    k = np.asarray(k)
+    
+    # Determine the dimensionality
+    if k.ndim > 2:
+        raise ValueError("k must be 0D, 1D, or 2D.")
+    
+    # If k is a probability (between 0 and 1), convert to count of successes
+    # We'll check if all values are between 0 and 1 or not
+    if np.issubdtype(k.dtype, np.floating):
+        # Check if all values are in [0,1]
+        if np.all((k >= 0) & (k <= 1)):
+            # Convert to integer successes
+            successes = k * n
+            # Check if close to integer
+            if not np.allclose(successes, np.round(successes), atol=1e-7):
+                warnings.warn(
+                    "Some values of k*n are not integers. Rounding to nearest integer.",
+                    UserWarning
+                )
+            successes = np.round(successes).astype(int)
+        else:
+            # If not all in [0,1], assume already raw counts
+            raise ValueError("Values must be int or floats between 0 and 1!")
+    else:
+        # If k is integer, assume already counts
+        successes = k.astype(int)
+    
+    # Determine the shape for the output
+    # If k is 0D, shape_of_output = ()
+    # If 1D, shape_of_output = (m,)
+    # If 2D, shape_of_output = (m, l)
+    shape_of_output = k.shape
+    
+    # Determine how many tests
+    if k.ndim == 0:
+        n_tests = 1
+    else:
+        n_tests = np.prod(shape_of_output)
+    
+    print(f"Conducting {n_tests} binomial Bayes factor test(s).")
+    
+    # If only one test (0D)
+    if k.ndim == 0:
+        # Single test
+        bf = pg.bayesfactor_binom(int(successes), n, p=p, a=a, b=b)
+        if return_pval:
+            res_freq = binomtest(int(successes), n, p=p)
+            return bf, res_freq.pvalue
+        else:
+            return bf
+    
+    elif k.ndim == 1:
+        # Multiple tests along one dimension
+        BF_out = np.zeros(shape_of_output)
+        if return_pval:
+            pval_out = np.zeros(shape_of_output)
+        for i in range(shape_of_output[0]):
+            res = pg.bayesfactor_binom(int(successes[i]), n, p=p, a=a, b=b)
+            BF_out[i] = res
+            if return_pval:
+                pval_out[i] = binomtest(int(successes[i]), n, p=p).pvalue
+        if return_pval:
+            return BF_out, pval_out
+        else:
+            return BF_out
+    
+    else:
+        # k.ndim == 2
+        BF_out = np.zeros(shape_of_output)
+        if return_pval:
+            pval_out = np.zeros(shape_of_output)
+        for idx in np.ndindex(shape_of_output):
+            res = pg.bayesfactor_binom(int(successes[idx]), n, p=p, a=a, b=b)
+            BF_out[idx] = res
+            if return_pval:
+                pval_out[idx] = binomtest(int(successes[idx]), n, p=p).pvalue
+        if return_pval:
+            return BF_out, pval_out
+        else:
+            return BF_out
+
+
+
+def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707, return_pval=False):
     """
     Compute Bayes Factors from a t-test using Pingouin's JZS method, applied to 
     data arrays that can be 1D, 2D, or 3D. 
@@ -91,29 +225,19 @@ def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707):
     
     print(f"We will conduct a {test_type} t-test for {n_tests} point(s).")
 
-    # Function to run a single t-test
-    def run_ttest(x_data, y_data):
-        # pg.ttest requires arrays for both x and y if not testing a scalar
-        # If testing against scalar, provide y_data = None and use x_data vs 0
-        if y_is_scalar:
-            # One-sample test against y_val
-            res = pg.ttest(x_data, np.ones_like(x_data)*y_val, paired=paired, 
-                           alternative=alternative, r=r)
-        else:
-            # Two-sample test
-            res = pg.ttest(x_data, y_data, paired=paired, 
-                           alternative=alternative, r=r)
-        return res
-
     # Prepare result containers
     if n_tests == 1:
         res = pg.ttest(x, y, paired=paired, 
                 alternative=alternative, r=r)
-        return res['BF10'].values[0]
+        if return_pval:
+            return res['BF10'].values[0], res['p-val'].values[0]
+        else:
+            return res['BF10'].values[0]
     else:
         # Multiple tests: loop over the shape and run test for each slice
         BF_out = np.zeros(shape_of_output)
-
+        if return_pval:
+            pval_out = np.zeros(shape_of_output)
         # We will iterate over all indices in shape_without_n using np.ndindex
         for idx in np.ndindex(shape_of_output):
             # Construct slice
@@ -131,12 +255,38 @@ def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707):
             # run the test
             res = pg.ttest(x_slice, y_slice, paired=paired, alternative=alternative, r=r)
             BF_out[idx] = res['BF10'].values[0]
-
-        return BF_out
+            if return_pval:
+                pval_out[idx] = res['p-val'].values[0]
+        if return_pval:
+            return BF_out, pval_out
+        else:
+            return BF_out
 
 
 def sim_decoding_binomial(t0, tmax, sfreq, scale_factor=3, tstart=0, ntrials=100):
+    """
+    Simulate a 1D time series of decoding accuracy using a binomial distribution.
 
+    Parameters
+    ----------
+    t0 : int
+        Start time of the simulation (in seconds).
+    tmax : int
+        End time of the simulation (in seconds).
+    sfreq : int
+        Sampling frequency (number of samples per second).
+    scale_factor : float, optional
+        Factor to normalize the decoding accuracy. Default is 3.
+    tstart : float, optional
+        Location parameter for the gamma distribution. Default is 0.
+    ntrials : int, optional
+        Number of trials for the binomial distribution. Default is 100.
+
+    Returns
+    -------
+    numpy.ndarray
+        Simulated number of successes (k) for each time point in the time series.
+    """
     # Simulate a time series of decoding accuracy:
     times = np.linspace(t0, tmax, sfreq * (tmax - t0))
     # Create a time series of decoding accuracy:
@@ -145,41 +295,47 @@ def sim_decoding_binomial(t0, tmax, sfreq, scale_factor=3, tstart=0, ntrials=100
     decoding_accuracy_true = 0.5 + (decoding_accuracy/np.max(decoding_accuracy))/scale_factor
 
     # Loop through each time points:
-    obs = []
-    for i, t in enumerate(times):
-        k = np.random.binomial(ntrials, decoding_accuracy_true[i])  # number of successes
-        # Create the vector:
-        y = np.array([1] * int(k) + [0] * int(ntrials - k))
-        # Compute the bayes factor:
-        obs.append(y)
+    k = np.random.binomial(ntrials, decoding_accuracy_true)  # number of successes
 
+    return k
+
+
+
+def sim_decoding_binomial_2d(t0, tmax, sfreq, scale_factor=3, tstart=0, ntrials=100):
+    """
+    Simulate a 2D matrix of decoding accuracy using a binomial distribution.
+
+    Parameters
+    ----------
+    t0 : int
+        Start time of the simulation (in seconds).
+    tmax : int
+        End time of the simulation (in seconds).
+    sfreq : int
+        Sampling frequency (number of samples per second).
+    scale_factor : float, optional
+        Factor to normalize the decoding accuracy matrix. Default is 3.
+    tstart : float, optional
+        Location parameter for the gamma distribution. Default is 0.
+    ntrials : int, optional
+        Number of trials for the binomial distribution. Default is 100.
+
+    Returns
+    -------
+    numpy.ndarray
+        Simulated 2D array of binomial observations for decoding accuracy.
+    """
+    # Simulate a time series of decoding accuracy:
+    times = np.linspace(t0, tmax, sfreq * (tmax - t0))
+    # Create a time series of decoding accuracy:
+    decoding_accuracy = gamma.pdf(times, 3, scale=0.2, loc=tstart)
+    # Calcuate the probability matrix:
+    prob_matrix = np.outer(decoding_accuracy, decoding_accuracy)
+
+    # Normalize it:
+    prob_matrix_norm = 0.5 + (prob_matrix/np.max(prob_matrix))/scale_factor
+
+    # Create observation
+    obs = np.random.binomial(n=ntrials, p=prob_matrix_norm)
     return obs
-
-
-def beta_binom_evidence(prior, y):
-    """
-    Compute the marginal likelihood, analytically, for a beta-binomial model.
-
-    prior : tuple
-        tuple of alpha and beta parameter for the prior (beta distribution)
-    y : array
-        array with "1" and "0" corresponding to the success and fails respectively
-    """
-    alpha, beta = prior
-    h = np.sum(y)
-    n = len(y)
-    p_y = np.exp(betaln(alpha + h, beta + n - h) - betaln(alpha, beta))
-    return p_y
-
-
-def binomial_bf(y, theta_h0=0.5, prior_h1=[1, 1]):
-
-    # Make sure that the input is a numpy array:
-    
-    # Compute the probability of the data null:
-    p_data_given_H0 = binom.pmf(np.sum(y), y.shape[0], theta_h0)
-    # Compute the probability of the data given the alternative hypothesis:
-    p_data_given_H1 = beta_binom_evidence(prior_h1, y)
-
-    return p_data_given_H1/p_data_given_H0
 
