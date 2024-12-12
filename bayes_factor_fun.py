@@ -1,13 +1,8 @@
 from scipy.special import betaln
-import numpy as np
+from scipy.special import beta as beta_function
 from scipy.stats import beta, binom
 from scipy.stats import gamma, binomtest
-import matplotlib.pyplot as plt
-
-
-import numpy as np
-import pingouin as pg
-
+from scipy.integrate import quad
 
 import numpy as np
 import warnings
@@ -339,3 +334,270 @@ def sim_decoding_binomial_2d(t0, tmax, sfreq, scale_factor=3, tstart=0, ntrials=
     obs = np.random.binomial(n=ntrials, p=prob_matrix_norm)
     return obs
 
+from scipy.special import beta as beta_func
+from scipy.stats import norm
+
+
+def scaled_beta_tau(tau, alpha=1.0, beta=1.0):
+    """
+    Compute the scaled Beta prior for Kendall's tau.
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        The Kendall's tau value(s) at which to evaluate the prior.
+    alpha : float, optional
+        The alpha parameter for the Beta function, by default 1.0.
+    beta : float, optional
+        The beta parameter for the Beta function, by default 1.0.
+
+    Returns
+    -------
+    float or ndarray
+        The value(s) of the scaled beta prior at tau.
+    """
+    tau = np.atleast_1d(tau)
+    val = ((np.pi * 2 ** (-2 * alpha)) / beta_func(alpha, alpha)) * (
+        np.cos((np.pi * tau) / 2) ** (2 * alpha - 1)
+    )
+    return val if val.size > 1 else val[0]
+
+
+def prior_tau(tau, kappa=1.0):
+    """
+    Compute the prior distribution p(tau) for two-sided tests.
+
+    p(tau) = scaledBetaTau(tau, alpha=1/kappa, beta=1/kappa)
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        Kendall's tau value(s).
+    kappa : float, optional
+        The parameter that controls the prior shape, by default 1.0.
+
+    Returns
+    -------
+    float or ndarray
+        Prior density at tau.
+    """
+    return scaled_beta_tau(tau, alpha=1.0 / kappa, beta=1.0 / kappa)
+
+
+def prior_tau_positive(tau, kappa=1.0):
+    """
+    Compute the one-sided prior distribution p(tau) for tau in [0,1].
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        Kendall's tau value(s).
+    kappa : float, optional
+        The parameter controlling the shape of the prior, by default 1.0.
+
+    Returns
+    -------
+    float or ndarray
+        Prior density at tau (0 if tau outside [0,1]).
+    """
+    tau = np.atleast_1d(tau)
+    result = np.zeros_like(tau)
+    idx = (tau >= 0) & (tau <= 1)
+    result[idx] = 2 * prior_tau(tau[idx], kappa)
+    return result if result.size > 1 else result[0]
+
+
+def prior_tau_negative(tau, kappa=1.0):
+    """
+    Compute the one-sided prior distribution p(tau) for tau in [-1,0].
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        Kendall's tau value(s).
+    kappa : float, optional
+        The parameter controlling the shape of the prior, by default 1.0.
+
+    Returns
+    -------
+    float or ndarray
+        Prior density at tau (0 if tau outside [-1,0]).
+    """
+    tau = np.atleast_1d(tau)
+    result = np.zeros_like(tau)
+    idx = (tau >= -1) & (tau <= 0)
+    result[idx] = 2 * prior_tau(tau[idx], kappa)
+    return result if result.size > 1 else result[0]
+
+
+def post_density_kendall_tau(tau, T_star, n, kappa=1.0, var=1.0, test="two-sided"):
+    """
+    Compute the unnormalized posterior density for Kendall's tau.
+
+    The posterior is proportional to p(T_star|tau)*p(tau).
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        Kendall's tau value(s).
+    T_star : float
+        Standardized Kendall's tau statistic.
+    n : int
+        Sample size.
+    kappa : float, optional
+        Parameter controlling the prior shape, by default 1.0.
+    var : float, optional
+        Variance parameter for the likelihood. min(var,1) is used, by default 1.0.
+    test : str, optional
+        Type of test: "two-sided", "positive", or "negative". By default "two-sided".
+
+    Returns
+    -------
+    float or ndarray
+        Unnormalized posterior density at tau.
+    """
+    tau = np.atleast_1d(tau)
+    var = min(1.0, var)
+
+    # Select prior function based on test type
+    if test == "two-sided":
+        prior_func = prior_tau
+    elif test == "positive":
+        prior_func = prior_tau_positive
+    elif test == "negative":
+        prior_func = prior_tau_negative
+    else:
+        raise ValueError("test must be 'two-sided', 'positive', or 'negative'.")
+
+    # Likelihood for T* given tau
+    likelihood = norm.pdf(T_star, loc=1.5 * tau * np.sqrt(n), scale=np.sqrt(var))
+    posterior_unnormalized = likelihood * prior_func(tau)
+
+    return posterior_unnormalized if posterior_unnormalized.size > 1 else posterior_unnormalized[0]
+
+
+def posterior_tau(tau, kentau, n, kappa=1.0, var=1.0, test="two-sided"):
+    """
+    Compute the normalized posterior density p(tau|data).
+
+    Parameters
+    ----------
+    tau : float or ndarray
+        Kendall's tau value(s) at which to evaluate the posterior.
+    kentau : float
+        Observed Kendall's tau.
+    n : int
+        Sample size.
+    kappa : float, optional
+        Parameter controlling prior shape, by default 1.0.
+    var : float, optional
+        Variance parameter for the likelihood (min(1,var) used), by default 1.0.
+    test : str, optional
+        Type of test: "two-sided", "positive", or "negative", by default "two-sided".
+
+    Returns
+    -------
+    float or ndarray
+        The posterior density at tau.
+    """
+    tau = np.atleast_1d(tau)
+    var = min(1.0, var)
+
+    # Compute T*
+    T_star = (kentau * ((n * (n - 1)) / 2.0)) / np.sqrt(n * (n - 1) * (2 * n + 5) / 18.0)
+
+    # Integration limits based on test
+    if test == "two-sided":
+        lims = (-1, 1)
+    elif test == "positive":
+        lims = (0, 1)
+    elif test == "negative":
+        lims = (-1, 0)
+    else:
+        raise ValueError("test must be 'two-sided', 'positive', or 'negative'.")
+
+    def integrand(x):
+        return post_density_kendall_tau(x, T_star, n, kappa, var, test=test)
+
+    integral_val, _ = quad(integrand, lims[0], lims[1])
+
+    post_vals = post_density_kendall_tau(tau, T_star, n, kappa, var, test=test) / integral_val
+    return post_vals
+
+
+def bf_kendall_tau(tau, n, kappa=1.0, var=1.0):
+    """
+    Compute Bayes factors for Kendall's tau.
+
+    Parameters
+    ----------
+    tau : float
+        Observed Kendall's tau.
+    n : int
+        Sample size.
+    kappa : float, optional
+        Parameter controlling the prior shape, by default 1.0.
+    var : float, optional
+        Variance parameter for the likelihood, by default 1.0.
+
+    Returns
+    -------
+    dict
+        A dictionary with keys 'n', 'r', 'bf10', 'bfPlus0', and 'bfMin0' representing sample size,
+        observed tau, and the three Bayes factors respectively.
+    """
+    result = {
+        'n': n,
+        'r': tau,
+        'bf10': None,
+        'bfPlus0': None,
+        'bfMin0': None
+    }
+
+    # BF10 (two-sided)
+    result['bf10'] = prior_tau(0, kappa) / posterior_tau(0, tau, n, kappa=kappa, var=var, test="two-sided")
+
+    # BF+0 (one-sided, positive)
+    result['bfPlus0'] = prior_tau_positive(0, kappa) / posterior_tau(0, tau, n, kappa=kappa, var=var, test="positive")
+
+    # BF-0 (one-sided, negative)
+    result['bfMin0'] = prior_tau_negative(0, kappa) / posterior_tau(0, tau, n, kappa=kappa, var=var, test="negative")
+
+    return result
+
+
+def kendall_bf_from_data(x, y, kappa=1.0, var=1.0):
+    """
+    Compute Bayes factors for Kendall's tau given raw data.
+
+    Parameters
+    ----------
+    x : array_like
+        Data vector for variable X.
+    y : array_like
+        Data vector for variable Y.
+    kappa : float, optional
+        Parameter controlling the prior shape, by default 1.0.
+    var : float, optional
+        Variance parameter for the likelihood, by default 1.0.
+
+    Returns
+    -------
+    tuple
+        (tau, bf_result) where tau is the Kendall's tau and bf_result is a dictionary of Bayes factors.
+    """
+    res = pg.corr(x, y, method='kendall')
+    tau_val = res['r'].values[0]
+    n = len(x)
+    bf_result = bf_kendall_tau(tau_val, n, kappa=kappa, var=var)
+    return tau_val, res['p-val'].values[0], bf_result
+
+
+if __name__ == "__main__":
+    # Example usage
+    yourKendallTauValue = -0.3
+    yourN = 20
+
+    # Compute BFs with given tau and N
+    bf_result = bf_kendall_tau(yourKendallTauValue, yourN)
+    print("Bayes Factors:", bf_result)
