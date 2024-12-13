@@ -11,231 +11,230 @@ import pingouin as pg
 from mne.stats.cluster_level import _pval_from_histogram
 
 
-def fit_beta_distribution(data):
-    """
-    Fit a Beta distribution to data in [0,1] via maximum likelihood.
-    
-    Parameters
-    ----------
-    data : array-like
-        Observed values in [0,1].
-        
-    Returns
-    -------
-    alpha : float
-        Estimated alpha parameter of Beta distribution.
-    beta : float
-        Estimated beta parameter of Beta distribution.
-    """
-    data = np.asarray(data)
-    if np.any((data < 0) | (data > 1)):
-        raise ValueError("All data must be in [0,1] to fit a Beta distribution.")
-
-    # Initial estimates using method of moments:
-    mean = np.mean(data)
-    var = np.var(data)
-    # Avoid division by zero or degenerate cases
-    if var == 0:
-        # If var=0, all data points are identical, say data=c. For Beta distribution:
-        # c = alpha/(alpha+beta)
-        # With no variance, pick alpha=beta=some large number to approximate a point mass
-        # or just pick alpha=beta=1000 or something large. Let's pick a large number to approximate.
-        # Or just alpha=mean*(large), beta=(1-mean)*large
-        large = 1000
-        alpha = max(mean * large, 1e-3)
-        beta = max((1 - mean) * large, 1e-3)
-        return alpha, beta
-
-    # Method of moments initial guess
-    # mean = alpha/(alpha+beta)
-    # var = (alpha*beta)/((alpha+beta)^2*(alpha+beta+1))
-    # Let's solve for alpha,beta from mean & var:
-    # alpha+beta = m = (mean*(1-mean)/var - 1)
-    # alpha = mean*m, beta = (1-mean)*m
-    m = (mean * (1 - mean) / var) - 1
-    alpha0 = mean * m
-    beta0 = (1 - mean) * m
-    alpha0 = max(alpha0, 1e-3)
-    beta0 = max(beta0, 1e-3)
-
-    # Negative log-likelihood for Beta distribution
-    # pdf(x;alpha,beta) = x^(alpha-1) (1-x)^(beta-1)/Beta(alpha,beta)
-    # NLL = -sum(log(pdf))
-    def neg_log_likelihood(params):
-        a, b = params
-        if a <= 0 or b <= 0:
-            return np.inf
-        ll = (a - 1)*np.sum(np.log(data)) + (b - 1)*np.sum(np.log(1 - data)) - data.size*np.log(beta_func(a, b))
-        return -ll
-
-    res = minimize(neg_log_likelihood, [alpha0, beta0], method='L-BFGS-B', bounds=[(1e-6, None), (1e-6, None)])
-    if not res.success:
-        warnings.warn("Beta fitting did not converge. Using method-of-moments estimate.")
-        return alpha0, beta0
-    alpha_est, beta_est = res.x
-    return alpha_est, beta_est
+import numpy as np
+import warnings
+from scipy.stats import binomtest
+from scipy.special import beta as beta_func, betaln
+from scipy.optimize import minimize
+import pingouin as pg
 
 
 def beta_binom_ml(k, n, prior):
     """
-    Taken from: https://www.pymc.io/projects/examples/en/latest/diagnostics_and_criticism/Bayes_factor.html
-    Compute the marginal likelihood, analytically, for a beta-binomial model.
+    Compute the marginal likelihood for a Beta-Binomial model.
 
-    prior : tuple
-        tuple of alpha and beta parameter for the prior (beta distribution)
-    y : array
-        array with "1" and "0" corresponding to the success and fails respectively
+    Parameters
+    ----------
+    k : int
+        Number of observed successes.
+    n : int
+        Number of trials.
+    prior : tuple of float
+        (alpha, beta) parameters of the Beta prior.
+
+    Returns
+    -------
+    float
+        Marginal likelihood under the Beta-Binomial model.
+
+    Notes
+    -----
+    The marginal likelihood is given by:
+        m = Beta(alpha+k, beta+n-k) / Beta(alpha, beta)
     """
     alpha, beta = prior
-    p_y = np.exp(betaln(alpha + k, beta + n - k) - betaln(alpha, beta))
-    return p_y
+    return np.exp(betaln(alpha + k, beta + n - k) - betaln(alpha, beta))
+
+def compute_null_posterior(p, n, alpha_0=1000, beta_0=1000):
+    # Calculate the total number of 'throws' across shuffles:
+    n_throw = p.shape[0] * n
+
+    # Convert p from frequency to successes:
+    alpha_post = np.sum(p * n).astype(int) + alpha_0
+    beta_post = beta_0 + n_throw - np.sum(p * n).astype(int)
+
+    return alpha_post, beta_post
 
 
-def compute_bf(k, n, a, b, p=0.5):
-    # Compute marginal likelihood under null and alternative
-    # If point_null, use pg.bayesfactor_binom for consistency
+
+def compute_bf(k, n, a, b, p=0.5, alpha_0=1000, beta_0=1000):
+    """
+    Compute the Bayes factor for a single test location.
+
+    Parameters
+    ----------
+    k : int
+        Number of observed successes.
+    n : int
+        Number of trials.
+    a : float
+        Alpha parameter of the alternative prior Beta(a, b).
+    b : float
+        Beta parameter of the alternative prior Beta(a, b).
+    p : float or array-like
+        If float, a point null hypothesis at p.
+        If array-like, empirical null samples from which a Beta distribution is fitted.
+
+    Returns
+    -------
+    float
+        Bayes factor (BF10).
+
+    Raises
+    ------
+    ValueError
+        If p is array-like and not in [0,1].
+    """
     if np.isscalar(p):
+        # Point null: use pg.bayesfactor_binom for convenience
         return pg.bayesfactor_binom(k, n, p=p, a=a, b=b)
     else:
-        # Fit Beta distribution to p_null_samples
-        a_null, b_null = fit_beta_distribution(p)
-        # m0 = Beta(alpha_null+k, beta_null+n-k)/Beta(alpha_null,beta_null)
-        m0 = beta_binom_ml(k, n, [a_null, b_null])
-        # m1 = Beta(a+k, b+n-k)/Beta(a,b)
-        m1 = beta_binom_ml(k, n, [a, b])
-        # BF10 = m1/m0
+        p = np.asarray(p)
+        # Fit a Beta distribution to the empirical null
+        a_null, b_null = compute_null_posterior(p, n, alpha_0=alpha_0, beta_0=beta_0)
+        m0 = beta_binom_ml(k, n, [a_null, b_null])   # null model marginal likelihood
+        m1 = beta_binom_ml(k, n, [a, b])             # alternative model marginal likelihood
         return m1 / m0
-    
+
 
 def pval_accuracy(k, n, p):
-    if np.iscalar(p):
+    """
+    Compute a p-value given observed successes, number of trials, and a null model.
+
+    Parameters
+    ----------
+    k : int
+        Number of observed successes.
+    n : int
+        Number of trials.
+    p : float or array-like
+        Null hypothesis definition:
+        - If float: a point null; use a binomial test.
+        - If array-like: an empirical distribution of accuracies; use _pval_from_histogram.
+
+    Returns
+    -------
+    float
+        P-value under the specified null.
+    """
+    if np.isscalar(p):
         return binomtest(k, n, p=p).pvalue
     else:
-        return _pval_from_histogram(k/n, p, 0)
+        return _pval_from_histogram([k/n], p, 0)[0]
 
 
-def bayes_binomtest(k, n, p=0.5, a=1, b=1):
+def bayes_binomtest(k, n, p=0.5, a=1, b=1, verbose=True):
     """
-    Compute Bayes Factors from a binomial test using a Beta-Binomial model,
-    applied to data that can be 0D, 1D, or 2D.
-    
+    Compute Bayes factors and p-values from a binomial test using a Beta-Binomial model.
+
+    This function can handle:
+    - A single test (k is scalar),
+    - Multiple tests in a 1D array,
+    - Multiple tests in a 2D array.
+
+    If `p` is a single float, it represents a point null hypothesis at p.
+    If `p` is array-like with shape k.shape+(M,), it is interpreted as an empirical null 
+    distribution for each test location.
+
     Parameters
     ----------
     k : float, int, or array-like
         Observed number of successes or observed accuracy.
-        If values are between 0 and 1, they will be interpreted as a probability 
-        of success and converted to number of successes by multiplying by n 
-        and rounding to the nearest integer.
-        
-        Shapes allowed:
-         - 0D: a single value
-         - 1D: (m) - e.g., decoding accuracies at multiple time points
-         - 2D: (m, l) - e.g., decoding accuracies for time-by-time generalization matrix
-         
+        If values are between 0 and 1, they will be interpreted as probabilities of success
+        and converted to counts by multiplying by n and rounding.
     n : int
         Number of trials.
-        
     p : float or array-like, default=0.5
-        The null hypothesis probability of success (if float) or samples from the empirical
-        null distribution (if array-like).
-        
-    a : float, default=1
-        Prior alpha parameter for the Beta distribution. Together with b, this defines
-        the prior Beta(a, b).
-        
-    b : float, default=1
-        Prior beta parameter for the Beta distribution.
-        
+        Null hypothesis definition:
+        - If float: point null at p.
+        - If array-like: must have p.shape = k.shape + (M,) for some M. 
+          Each slice p[idx] is the null samples for that test location.
+    a : float, optional
+        Alpha parameter for the alternative Beta prior, by default 1.
+    b : float, optional
+        Beta parameter for the alternative Beta prior, by default 1.
+
     Returns
     -------
-    BF10 : scalar, 1D array, or 2D array
-        The Bayes factor for each test location. Matches the shape of the input `k`, 
-        excluding the trial dimension (since `n` is a scalar).
-        
+    BF10 : scalar, ndarray
+        Bayes factor(s) for each test location, matching the shape of `k`.
+    pvals : scalar, ndarray
+        P-value(s) for each test location, matching the shape of `k`.
+
+    Raises
+    ------
+    ValueError
+        If `k` is not 0D, 1D, or 2D.
+        If `p` is array-like but does not have p.ndim == k.ndim+1 or p.shape[:k.ndim] != k.shape.
+        If k is out of allowed range.
+
     Notes
     -----
-    This function is meant for applying a binomial Bayes factor test to single decoding accuracy
-    values or small sets thereof (e.g. across time or across a time-by-time matrix).
-    It is NOT intended for computing Bayes factors across subjects. For example, you might have
-    already averaged decoding accuracies across subjects and wish to test if the decoding accuracy
-    is better than chance.
+    This function is not intended for combining Bayes factors across subjects. 
+    It is designed for single or small sets of values, e.g., decoding accuracies across 
+    time or in a time-by-time generalization matrix.
     """
-    # Convert input to array for consistent indexing
     k = np.asarray(k)
-    
-    # Determine the dimensionality
-    if k.ndim > 2:
-        raise ValueError("k must be 0D, 1D, or 2D.")
-    
-    # If k is a probability (between 0 and 1), convert to count of successes
-    # We'll check if all values are between 0 and 1 or not
-    if np.issubdtype(k.dtype, np.floating):
-        # Check if all values are in [0,1]
-        if np.all((k >= 0) & (k <= 1)):
-            # Convert to integer successes
-            successes = k * n
-            # Check if close to integer
-            if not np.allclose(successes, np.round(successes), atol=1e-7):
-                warnings.warn(
-                    "Some values of k*n are not integers. Rounding to nearest integer.",
-                    UserWarning
-                )
-            successes = np.round(successes).astype(int)
-        else:
-            # If not all in [0,1], assume already raw counts
-            raise ValueError("Values must be int or floats between 0 and 1!")
-    else:
-        # If k is integer, assume already counts
-        successes = k.astype(int)
-    
-    # Determine the shape for the output
-    # If k is 0D, shape_of_output = ()
-    # If 1D, shape_of_output = (m,)
-    # If 2D, shape_of_output = (m, l)
-    shape_of_output = k.shape
 
-        # Determine if p is scalar or array
-    if not np.isscalar(p):
-        p = np.asarray(p)
-        # Check shape compatibility
-        if p.ndim != k.ndim + 1:
-            raise ValueError("When p is array-like, p.ndim must be k.ndim+1, representing samples per test.")
-        if p.shape[:k.ndim] != k.shape:
-            raise ValueError("The shape of p (except last dim) must match k.shape.")
-        # p is now per-location null samples, e.g. (m, l, M) if k is (m,l)
-        # We'll fit a Beta distribution for each location in the loops.
-    
     # Determine how many tests
     if k.ndim == 0:
         n_tests = 1
     else:
-        n_tests = np.prod(shape_of_output)
-    
-    print(f"Conducting {n_tests} binomial Bayes factor test(s).")
-    
-    # If only one test (0D)
-    if k.ndim == 0:
-        bf = compute_bf(k, n, a, b, p=p)
-        pval = pval_accuracy(k, n, p)
-        return bf, pval
-    
-    elif k.ndim == 1:
-        # Multiple tests along one dimension
-        BF_out = np.zeros(shape_of_output)
-        pval_out = np.zeros(shape_of_output)
-        for i in range(shape_of_output[0]):
-            BF_out[i] = compute_bf(int(successes[i]), n, a, b, p=p[i, :])
-            pval_out[i] = pval_accuracy(k, n, p) 
-        return BF_out, pval_out
-    
+        n_tests = np.prod(k.shape)
+    if verbose:
+        print(f"Conducting {n_tests} binomial Bayes factor test(s).")
+
+    if k.ndim > 2:
+        raise ValueError("k must be 0D, 1D, or 2D.")
+
+    # Convert probabilities to counts if needed
+    if np.issubdtype(k.dtype, np.floating):
+        if np.all((k >= 0) & (k <= 1)):
+            successes = k * n
+            if not np.allclose(successes, np.round(successes), atol=1e-7):
+                warnings.warn("Some values of k*n are not integers. Rounding to nearest integer.", UserWarning)
+            successes = np.round(successes).astype(int)
+        else:
+            raise ValueError("Values must be int or floats between 0 and 1!")
     else:
-        # k.ndim == 2
-        BF_out = np.zeros(shape_of_output)
-        pval_out = np.zeros(shape_of_output)
-        for idx in np.ndindex(shape_of_output):
-            BF_out[idx] = compute_bf(int(successes[idx]), n, a, b, p=p[idx, :])
-            pval_out[idx] = pval_accuracy(int(successes[idx]), n, p[idx, :]) 
-        return BF_out, pval_out
+        successes = k.astype(int)
+
+    shape_of_output = k.shape
+
+    # Handle p array if provided
+    if not np.isscalar(p):
+        p = np.asarray(p)
+        if p.ndim != k.ndim + 1:
+            raise ValueError("When p is array-like, p.ndim must be k.ndim+1, representing samples per test.")
+        if p.shape[:k.ndim] != k.shape:
+            raise ValueError("The shape of p (except last dim) must match k.shape.")
+        print('Using null distribution to estimate H0 prior')
+
+    # Special case: if k is 0D (a single value)
+    if k.ndim == 0:
+        # Scalar case
+        bf = compute_bf(int(successes), n, a, b, p=p if not np.isscalar(p) else p)
+        pval = pval_accuracy(int(successes), n, p if not np.isscalar(p) else p)
+        return bf, pval
+
+    # For k.ndim == 1 or k.ndim == 2, handle with a single code path.
+    BF_out = np.zeros(shape_of_output)
+    pval_out = np.zeros(shape_of_output)
+
+    # Iterate over all test locations using np.ndindex
+    for idx in np.ndindex(shape_of_output):
+        k_succ = int(successes[idx])
+        if np.isscalar(p):
+            # Point null
+            local_p = p
+        else:
+            # Empirical null for this location is p[idx], a 1D array of null samples
+            local_p = p[idx]
+
+        BF_out[idx] = compute_bf(k_succ, n, a, b, p=local_p)
+        pval_out[idx] = pval_accuracy(k_succ, n, local_p)
+
+    return BF_out, pval_out
 
 
 def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707, return_pval=False):
