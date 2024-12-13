@@ -1,15 +1,120 @@
 from scipy.special import betaln
 from scipy.special import beta as beta_function
 from scipy.stats import beta, binom
+from scipy.optimize import minimize
 from scipy.stats import gamma, binomtest
 from scipy.integrate import quad
 
 import numpy as np
 import warnings
 import pingouin as pg
+from mne.stats.cluster_level import _pval_from_histogram
 
 
-def bayes_binomtest(k, n, p=0.5, a=1, b=1, return_pval=False):
+def fit_beta_distribution(data):
+    """
+    Fit a Beta distribution to data in [0,1] via maximum likelihood.
+    
+    Parameters
+    ----------
+    data : array-like
+        Observed values in [0,1].
+        
+    Returns
+    -------
+    alpha : float
+        Estimated alpha parameter of Beta distribution.
+    beta : float
+        Estimated beta parameter of Beta distribution.
+    """
+    data = np.asarray(data)
+    if np.any((data < 0) | (data > 1)):
+        raise ValueError("All data must be in [0,1] to fit a Beta distribution.")
+
+    # Initial estimates using method of moments:
+    mean = np.mean(data)
+    var = np.var(data)
+    # Avoid division by zero or degenerate cases
+    if var == 0:
+        # If var=0, all data points are identical, say data=c. For Beta distribution:
+        # c = alpha/(alpha+beta)
+        # With no variance, pick alpha=beta=some large number to approximate a point mass
+        # or just pick alpha=beta=1000 or something large. Let's pick a large number to approximate.
+        # Or just alpha=mean*(large), beta=(1-mean)*large
+        large = 1000
+        alpha = max(mean * large, 1e-3)
+        beta = max((1 - mean) * large, 1e-3)
+        return alpha, beta
+
+    # Method of moments initial guess
+    # mean = alpha/(alpha+beta)
+    # var = (alpha*beta)/((alpha+beta)^2*(alpha+beta+1))
+    # Let's solve for alpha,beta from mean & var:
+    # alpha+beta = m = (mean*(1-mean)/var - 1)
+    # alpha = mean*m, beta = (1-mean)*m
+    m = (mean * (1 - mean) / var) - 1
+    alpha0 = mean * m
+    beta0 = (1 - mean) * m
+    alpha0 = max(alpha0, 1e-3)
+    beta0 = max(beta0, 1e-3)
+
+    # Negative log-likelihood for Beta distribution
+    # pdf(x;alpha,beta) = x^(alpha-1) (1-x)^(beta-1)/Beta(alpha,beta)
+    # NLL = -sum(log(pdf))
+    def neg_log_likelihood(params):
+        a, b = params
+        if a <= 0 or b <= 0:
+            return np.inf
+        ll = (a - 1)*np.sum(np.log(data)) + (b - 1)*np.sum(np.log(1 - data)) - data.size*np.log(beta_func(a, b))
+        return -ll
+
+    res = minimize(neg_log_likelihood, [alpha0, beta0], method='L-BFGS-B', bounds=[(1e-6, None), (1e-6, None)])
+    if not res.success:
+        warnings.warn("Beta fitting did not converge. Using method-of-moments estimate.")
+        return alpha0, beta0
+    alpha_est, beta_est = res.x
+    return alpha_est, beta_est
+
+
+def beta_binom_ml(k, n, prior):
+    """
+    Taken from: https://www.pymc.io/projects/examples/en/latest/diagnostics_and_criticism/Bayes_factor.html
+    Compute the marginal likelihood, analytically, for a beta-binomial model.
+
+    prior : tuple
+        tuple of alpha and beta parameter for the prior (beta distribution)
+    y : array
+        array with "1" and "0" corresponding to the success and fails respectively
+    """
+    alpha, beta = prior
+    p_y = np.exp(betaln(alpha + k, beta + n - k) - betaln(alpha, beta))
+    return p_y
+
+
+def compute_bf(k, n, a, b, p=0.5):
+    # Compute marginal likelihood under null and alternative
+    # If point_null, use pg.bayesfactor_binom for consistency
+    if np.isscalar(p):
+        return pg.bayesfactor_binom(k, n, p=p, a=a, b=b)
+    else:
+        # Fit Beta distribution to p_null_samples
+        a_null, b_null = fit_beta_distribution(p)
+        # m0 = Beta(alpha_null+k, beta_null+n-k)/Beta(alpha_null,beta_null)
+        m0 = beta_binom_ml(k, n, [a_null, b_null])
+        # m1 = Beta(a+k, b+n-k)/Beta(a,b)
+        m1 = beta_binom_ml(k, n, [a, b])
+        # BF10 = m1/m0
+        return m1 / m0
+    
+
+def pval_accuracy(k, n, p):
+    if np.iscalar(p):
+        return binomtest(k, n, p=p).pvalue
+    else:
+        return _pval_from_histogram(k/n, p, 0)
+
+
+def bayes_binomtest(k, n, p=0.5, a=1, b=1):
     """
     Compute Bayes Factors from a binomial test using a Beta-Binomial model,
     applied to data that can be 0D, 1D, or 2D.
@@ -30,8 +135,9 @@ def bayes_binomtest(k, n, p=0.5, a=1, b=1, return_pval=False):
     n : int
         Number of trials.
         
-    p : float, default=0.5
-        The null hypothesis probability of success.
+    p : float or array-like, default=0.5
+        The null hypothesis probability of success (if float) or samples from the empirical
+        null distribution (if array-like).
         
     a : float, default=1
         Prior alpha parameter for the Beta distribution. Together with b, this defines
@@ -87,6 +193,17 @@ def bayes_binomtest(k, n, p=0.5, a=1, b=1, return_pval=False):
     # If 1D, shape_of_output = (m,)
     # If 2D, shape_of_output = (m, l)
     shape_of_output = k.shape
+
+        # Determine if p is scalar or array
+    if not np.isscalar(p):
+        p = np.asarray(p)
+        # Check shape compatibility
+        if p.ndim != k.ndim + 1:
+            raise ValueError("When p is array-like, p.ndim must be k.ndim+1, representing samples per test.")
+        if p.shape[:k.ndim] != k.shape:
+            raise ValueError("The shape of p (except last dim) must match k.shape.")
+        # p is now per-location null samples, e.g. (m, l, M) if k is (m,l)
+        # We'll fit a Beta distribution for each location in the loops.
     
     # Determine how many tests
     if k.ndim == 0:
@@ -98,44 +215,27 @@ def bayes_binomtest(k, n, p=0.5, a=1, b=1, return_pval=False):
     
     # If only one test (0D)
     if k.ndim == 0:
-        # Single test
-        bf = pg.bayesfactor_binom(int(successes), n, p=p, a=a, b=b)
-        if return_pval:
-            res_freq = binomtest(int(successes), n, p=p)
-            return bf, res_freq.pvalue
-        else:
-            return bf
+        bf = compute_bf(k, n, a, b, p=p)
+        pval = pval_accuracy(k, n, p)
+        return bf, pval
     
     elif k.ndim == 1:
         # Multiple tests along one dimension
         BF_out = np.zeros(shape_of_output)
-        if return_pval:
-            pval_out = np.zeros(shape_of_output)
+        pval_out = np.zeros(shape_of_output)
         for i in range(shape_of_output[0]):
-            res = pg.bayesfactor_binom(int(successes[i]), n, p=p, a=a, b=b)
-            BF_out[i] = res
-            if return_pval:
-                pval_out[i] = binomtest(int(successes[i]), n, p=p).pvalue
-        if return_pval:
-            return BF_out, pval_out
-        else:
-            return BF_out
+            BF_out[i] = compute_bf(int(successes[i]), n, a, b, p=p[i, :])
+            pval_out[i] = pval_accuracy(k, n, p) 
+        return BF_out, pval_out
     
     else:
         # k.ndim == 2
         BF_out = np.zeros(shape_of_output)
-        if return_pval:
-            pval_out = np.zeros(shape_of_output)
+        pval_out = np.zeros(shape_of_output)
         for idx in np.ndindex(shape_of_output):
-            res = pg.bayesfactor_binom(int(successes[idx]), n, p=p, a=a, b=b)
-            BF_out[idx] = res
-            if return_pval:
-                pval_out[idx] = binomtest(int(successes[idx]), n, p=p).pvalue
-        if return_pval:
-            return BF_out, pval_out
-        else:
-            return BF_out
-
+            BF_out[idx] = compute_bf(int(successes[idx]), n, a, b, p=p[idx, :])
+            pval_out[idx] = pval_accuracy(int(successes[idx]), n, p[idx, :]) 
+        return BF_out, pval_out
 
 
 def bayes_ttest(x, y=0, paired=False, alternative='two-sided', r=0.707, return_pval=False):
