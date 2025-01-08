@@ -19,6 +19,42 @@ from scipy.optimize import minimize
 import pingouin as pg
 
 
+def bic_to_bf10(bic_h1, bic_h0):
+    """
+    Convert Bayesian Information Criterion (BIC) values into a Bayes Factor (BF).
+
+    This function computes the Bayes Factor (BF) from the difference in BIC values between two competing models: 
+    the alternative hypothesis (H1) and the null hypothesis (H0). The Bayes Factor quantifies the relative evidence 
+    for one model over the other. This implementation returns evidence in favor of H0, adjust the order of input accordingly
+
+    The calculation is based on the formula provided by Wagenmakers (2007):
+
+        BF = exp((BIC_H0 - BIC_H1) / 2)
+
+    Parameters:
+    -----------
+    bic_h1 : float
+        The Bayesian Information Criterion (BIC) value for the alternative hypothesis (H1).
+    
+    bic_h0 : float
+        The Bayesian Information Criterion (BIC) value for the null hypothesis (H0).
+
+    Returns:
+    --------
+    bf01 : float
+        The Bayes Factor, representing the relative evidence in favor of H0 compared to H1. A BF > 1 indicates 
+        more support for H0, while BF < 1 indicates more support for H0. The magnitude of BF provides a quantitative 
+        measure of the strength of evidence.
+
+    References:
+    -----------
+    Wagenmakers, Eric-Jan. "A practical solution to the pervasive problems of p values." 
+    Psychonomic Bulletin & Review 14.5 (2007): 779-804.
+    """
+    bf01 = np.exp((bic_h1 - bic_h0) / 2)
+    return 1/bf01
+
+
 def beta_binom_ml(k, n, prior):
     """
     Compute the marginal likelihood for a Beta-Binomial model.
@@ -45,7 +81,66 @@ def beta_binom_ml(k, n, prior):
     alpha, beta = prior
     return np.exp(betaln(alpha + k, beta + n - k) - betaln(alpha, beta))
 
+
+def cap_beta_params(alpha, beta, cap=5000):
+    """
+    Cap the Beta parameters at a specified maximum, preserving their ratio.
+
+    Parameters
+    ----------
+    alpha : float
+        Alpha parameter of the Beta distribution.
+    beta : float
+        Beta parameter of the Beta distribution.
+    cap : float, optional
+        Maximum allowed value for alpha or beta (default=5000).
+
+    Returns
+    -------
+    alpha_capped, beta_capped : float, float
+        The adjusted alpha and beta values, capped but maintaining the ratio alpha:beta.
+    """
+    max_val = max(alpha, beta)
+    if max_val > cap:
+        scale = cap / max_val
+        alpha_capped = alpha * scale
+        beta_capped = beta * scale
+        return alpha_capped, beta_capped
+    else:
+        return alpha, beta
+
+
 def compute_null_posterior(p, n, alpha_0=1000, beta_0=1000):
+    """
+    Compute the posterior Beta parameters (alpha_post, beta_post) for an empirical null.
+
+    Interprets each element of p as a probability of success in n trials.
+    Summarizes them all by summing across the entire array.
+
+    Parameters
+    ----------
+    p : ndarray
+        Array of empirical null accuracies in [0,1].
+    n : int
+        Number of trials per shuffle iteration.
+    alpha_0 : float, optional
+        Prior alpha parameter, by default 1000 (concentrated near p=0.5 if large).
+    beta_0 : float, optional
+        Prior beta parameter, by default 1000.
+
+    Returns
+    -------
+    alpha_post : float
+        Posterior alpha parameter after incorporating empirical null data.
+    beta_post : float
+        Posterior beta parameter.
+
+    Notes
+    -----
+    This approach assumes each entry in `p` is a separate binomial estimate from n trials.
+    The posterior is computed by effectively summing the binomial successes and failures
+    across all shuffle instances.
+    """
     # Calculate the total number of 'throws' across shuffles:
     n_throw = p.shape[0] * n
 
@@ -53,8 +148,7 @@ def compute_null_posterior(p, n, alpha_0=1000, beta_0=1000):
     alpha_post = np.sum(p * n).astype(int) + alpha_0
     beta_post = beta_0 + n_throw - np.sum(p * n).astype(int)
 
-    return alpha_post, beta_post
-
+    return cap_beta_params(alpha_post, beta_post, cap=5000)
 
 
 def compute_bf(k, n, a, b, p=0.5, alpha_0=1000, beta_0=1000):
@@ -208,7 +302,8 @@ def bayes_binomtest(k, n, p=0.5, a=1, b=1, verbose=True):
             raise ValueError("When p is array-like, p.ndim must be k.ndim+1, representing samples per test.")
         if p.shape[:k.ndim] != k.shape:
             raise ValueError("The shape of p (except last dim) must match k.shape.")
-        print('Using null distribution to estimate H0 prior')
+        if verbose:
+            print('Using null distribution to estimate H0 prior')
 
     # Special case: if k is 0D (a single value)
     if k.ndim == 0:
